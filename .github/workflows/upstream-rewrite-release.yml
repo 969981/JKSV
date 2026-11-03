@@ -1,0 +1,163 @@
+name: JKSV upstream rewrite sync and release
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [Rewrite---Dropped]
+    paths:
+      - '.github/workflows/upstream-rewrite-release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jksv-rewrite-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Fast-forward rewrite from J-D-K/JKSV
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      sha: ${{ steps.sync.outputs.sha }}
+      short_sha: ${{ steps.sync.outputs.short_sha }}
+    steps:
+      - name: Checkout controller (default) branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Compare and synchronize upstream rewrite
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/J-D-K/JKSV.git
+          git fetch --no-tags origin +refs/heads/rewrite:refs/remotes/origin/rewrite
+          git fetch --no-tags upstream +refs/heads/rewrite:refs/remotes/upstream/rewrite
+          old="$(git rev-parse refs/remotes/origin/rewrite)"
+          new="$(git rev-parse refs/remotes/upstream/rewrite)"
+          echo "sha=$new" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${new:0:8}" >> "$GITHUB_OUTPUT"
+          if [[ "$old" == "$new" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes: $new"
+          elif git merge-base --is-ancestor "$old" "$new"; then
+            git push origin "$new:refs/heads/rewrite"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Fast-forwarded rewrite: $old -> $new"
+          else
+            echo "::error::Local rewrite diverged; refusing destructive force-push."
+            exit 1
+          fi
+
+  build:
+    name: Build JKSV.nro with devkitPro
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: devkitpro/devkita64:latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact upstream revision and its submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          submodules: recursive
+
+      - name: Install JKSV Switch libraries
+        run: |
+          set -euo pipefail
+          dkp-pacman -Sy --needed --noconfirm \
+            switch-bzip2 switch-curl switch-freetype switch-harfbuzz \
+            switch-libjpeg-turbo switch-libjson-c switch-libpng \
+            switch-libwebp switch-sdl2 switch-sdl2_image \
+            switch-tinyxml2 switch-zlib
+
+      - name: Enable compiler caching
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: jksv-rewrite
+          max-size: 600M
+
+      - name: Build FsLib, SDLLib, resources and JKSV
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test -f Libraries/FsLib/Switch/FsLib/Makefile
+          test -f Libraries/SDLLib/SDL/Makefile
+          test -f Assets/compress_assets.py
+          python3 --version
+          make -j4 PREFIX="ccache aarch64-none-elf-"
+          test -s JKSV.nro
+
+      - name: Package NRO, Switch SD ZIP and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release/staging/switch
+          cp JKSV.nro release/JKSV.nro
+          cp JKSV.nro release/staging/switch/JKSV.nro
+          (cd release/staging && zip -q -r "../JKSV-rewrite-${{ needs.sync.outputs.short_sha }}.zip" switch)
+          rm -rf release/staging
+          test -s release/JKSV.nro
+          unzip -t "release/JKSV-rewrite-${{ needs.sync.outputs.short_sha }}.zip" >/dev/null
+          (cd release && sha256sum JKSV.nro "JKSV-rewrite-${{ needs.sync.outputs.short_sha }}.zip" > SHA256SUMS.txt)
+          printf 'Upstream: https://github.com/J-D-K/JKSV\nUpstream branch: rewrite\nUpstream commit: %s\nBuild: devkitpro/devkita64, FsLib, SDLLib\n' \
+            '${{ needs.sync.outputs.sha }}' > release/BUILD-INFO.txt
+
+      - name: Upload verified build files
+        uses: actions/upload-artifact@v4
+        with:
+          name: JKSV-rewrite-release
+          path: |
+            release/JKSV.nro
+            release/JKSV-rewrite-*.zip
+            release/SHA256SUMS.txt
+            release/BUILD-INFO.txt
+          if-no-files-found: error
+
+  release:
+    name: Publish commit-specific JKSV release
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: JKSV-rewrite-release
+          path: release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: autosync-rewrite-${{ needs.sync.outputs.short_sha }}
+          name: JKSV rewrite ${{ needs.sync.outputs.short_sha }}
+          target_commitish: ${{ needs.sync.outputs.sha }}
+          make_latest: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            Automatic build of [J-D-K/JKSV](https://github.com/J-D-K/JKSV) from upstream `rewrite`.
+            Upstream commit: `${{ needs.sync.outputs.sha }}`.
+            
+            Download **JKSV.nro** to install it manually, or extract the SD-layout ZIP at the root of your Switch SD card.
+            Includes SHA-256 checksums and BUILD-INFO.txt.
+            This is an independently compiled build, not an official upstream release.
+          files: |
+            release/JKSV.nro
+            release/JKSV-rewrite-*.zip
+            release/SHA256SUMS.txt
+            release/BUILD-INFO.txt
