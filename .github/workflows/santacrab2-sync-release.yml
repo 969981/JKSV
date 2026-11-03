@@ -1,0 +1,190 @@
+name: JKSV santacrab2 sync and release
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [Rewrite---Dropped]
+    paths:
+      - '.github/workflows/santacrab2-sync-release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jksv-santacrab2-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Synchronize santacrab2/JKSV rewrite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+      short_sha: ${{ steps.sync.outputs.short_sha }}
+      sync_sha: ${{ steps.sync.outputs.sync_sha }}
+    steps:
+      - name: Checkout controlling default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Detect upstream changes and import source snapshot
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add santacrab2-upstream https://github.com/santacrab2/JKSV.git
+          git fetch --no-tags origin +refs/heads/santacrab2:refs/remotes/origin/santacrab2
+          git fetch --no-tags santacrab2-upstream +refs/heads/rewrite:refs/remotes/santacrab2-upstream/rewrite
+          before="$(git rev-parse refs/remotes/origin/santacrab2)"
+          upstream="$(git rev-parse refs/remotes/santacrab2-upstream/rewrite)"
+          previous="$(git show "$before:.santacrab2-upstream-sha" 2>/dev/null || true)"
+          echo "source_sha=$upstream" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${upstream:0:8}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$previous" == "$upstream" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "sync_sha=$before" >> "$GITHUB_OUTPUT"
+            echo "No new santacrab2 commits ($upstream)"
+            exit 0
+          fi
+
+          # Protect against upstream history rewrites and unrelated local branches.
+          if [[ -n "$previous" ]]; then
+            if ! git merge-base --is-ancestor "$previous" "$upstream"; then
+              echo "::error::Upstream rewrite history diverged; refusing automatic overwrite."
+              exit 1
+            fi
+          elif ! git merge-base --is-ancestor "$before" "$upstream"; then
+            echo "::error::Initial tracking branch is not based on santacrab2 upstream."
+            exit 1
+          fi
+
+          # Import the exact upstream source and submodule pointers, but preserve
+          # local GitHub Actions workflows to avoid GITHUB_TOKEN workflow permission errors.
+          git read-tree --reset "$upstream^{tree}"
+          git rm -r -q --cached --ignore-unmatch .github/workflows
+          if git ls-tree -r --name-only "$before" .github/workflows | grep -q .; then
+            git restore --source="$before" --staged -- .github/workflows
+          fi
+          printf '%s\n' "$upstream" > .santacrab2-upstream-sha
+          git add .santacrab2-upstream-sha
+          tree="$(git write-tree)"
+          sync_commit="$(printf 'sync: santacrab2/JKSV rewrite %s [skip ci]\n' "$upstream" |
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit-tree "$tree" -p "$before")"
+          git push origin "$sync_commit:refs/heads/santacrab2"
+          echo "sync_sha=$sync_commit" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Synced source $upstream as $sync_commit"
+
+  build:
+    name: Build santacrab2 JKSV.nro
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: devkitpro/devkita64:latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout synchronized santacrab2 source and submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sync_sha }}
+          submodules: recursive
+
+      - name: Install Switch devkitPro dependencies
+        run: |
+          set -euo pipefail
+          dkp-pacman -Sy --needed --noconfirm \
+            switch-bzip2 switch-curl switch-freetype switch-harfbuzz \
+            switch-libjpeg-turbo switch-libjson-c switch-libpng \
+            switch-libwebp switch-sdl2 switch-sdl2_image \
+            switch-tinyxml2 switch-zlib
+
+      - name: Restore ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: jksv-santacrab2
+          max-size: 600M
+
+      - name: Compile JKSV and required FsLib/SDLLib libraries
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test -f Libraries/FsLib/Switch/FsLib/Makefile
+          test -f Libraries/SDLLib/SDL/Makefile
+          test -f Assets/compress_assets.py
+          make -j4 PREFIX="ccache aarch64-none-elf-"
+          test -s JKSV.nro
+
+      - name: Verify and package NRO and SD-card ZIP
+        run: |
+          set -euo pipefail
+          mkdir -p release/staging/switch
+          cp JKSV.nro release/JKSV.nro
+          cp JKSV.nro release/staging/switch/JKSV.nro
+          (cd release/staging && zip -q -r "../JKSV-santacrab2-${{ needs.sync.outputs.short_sha }}.zip" switch)
+          rm -rf release/staging
+          unzip -t "release/JKSV-santacrab2-${{ needs.sync.outputs.short_sha }}.zip" >/dev/null
+          (cd release && sha256sum JKSV.nro JKSV-santacrab2-*.zip > SHA256SUMS.txt)
+          printf 'Upstream: https://github.com/santacrab2/JKSV\nUpstream branch: rewrite\nUpstream commit: %s\nLocal branch: santacrab2\nLocal commit: %s\nCompiler: devkitpro/devkita64\n' \
+            '${{ needs.sync.outputs.source_sha }}' '${{ needs.sync.outputs.sync_sha }}' > release/BUILD-INFO.txt
+
+      - name: Upload validated release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: jksv-santacrab2-release
+          path: |
+            release/JKSV.nro
+            release/JKSV-santacrab2-*.zip
+            release/SHA256SUMS.txt
+            release/BUILD-INFO.txt
+          if-no-files-found: error
+
+  release:
+    name: Publish independent santacrab2 Release
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: jksv-santacrab2-release
+          path: release
+
+      - name: Publish fork-specific release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: santacrab2-${{ needs.sync.outputs.short_sha }}
+          name: JKSV santacrab2 (${{ needs.sync.outputs.short_sha }})
+          target_commitish: ${{ needs.sync.outputs.sync_sha }}
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            Community build from [santacrab2/JKSV](https://github.com/santacrab2/JKSV) `rewrite` branch.
+            
+            Upstream source commit: `${{ needs.sync.outputs.source_sha }}`.
+            Tracking branch: `santacrab2`; controller: `Rewrite---Dropped`.
+            
+            Download `JKSV.nro` or extract the ZIP in the root of your Switch SD card.
+            Independent fork build; not an official J-D-K JKSV release.
+          files: |
+            release/JKSV.nro
+            release/JKSV-santacrab2-*.zip
+            release/SHA256SUMS.txt
+            release/BUILD-INFO.txt
